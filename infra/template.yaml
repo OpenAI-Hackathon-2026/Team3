@@ -1,0 +1,452 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Second Serving serverless application
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedPattern: '^[a-z0-9-]+$'
+  OpenAIModel:
+    Type: String
+    Default: gpt-5.5
+  FrontendOrigin:
+    Type: String
+    Default: http://localhost:3000
+  SiteUrl:
+    Type: String
+    Default: http://localhost:3000
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [arm64]
+    MemorySize: 1024
+    Timeout: 29
+    Tracing: Active
+    Environment:
+      Variables:
+        ENVIRONMENT: !Ref Environment
+        USERS_TABLE: !Ref UsersTable
+        ORGANIZATIONS_TABLE: !Ref OrganizationsTable
+        MEMBERSHIPS_TABLE: !Ref MembershipsTable
+        LISTINGS_TABLE: !Ref ListingsTable
+        RESERVATIONS_TABLE: !Ref ReservationsTable
+        AGENT_RUNS_TABLE: !Ref AgentRunsTable
+        MEDIA_BUCKET: !Ref MediaBucket
+        OPENAI_SECRET_ARN: !Ref OpenAISecret
+        OPENAI_MODEL: !Ref OpenAIModel
+        LANGSMITH_SECRET_ARN: !Ref LangSmithSecret
+        LANGSMITH_TRACING: 'true'
+        LANGSMITH_PROJECT: !Sub second-serving-${Environment}
+
+Resources:
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub second-serving-${Environment}
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      DeletionProtection: ACTIVE
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 10
+          RequireLowercase: true
+          RequireNumbers: true
+          RequireSymbols: false
+          RequireUppercase: true
+      UserAttributeUpdateSettings:
+        AttributesRequireVerificationBeforeUpdate: [email]
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub second-serving-web-${Environment}
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      PreventUserExistenceErrors: ENABLED
+      EnableTokenRevocation: true
+      ExplicitAuthFlows:
+        - ALLOW_USER_SRP_AUTH
+        - ALLOW_REFRESH_TOKEN_AUTH
+      AccessTokenValidity: 1
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        AccessToken: hours
+        IdToken: hours
+        RefreshToken: days
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: !Ref Environment
+      CorsConfiguration:
+        AllowOrigins: [!Ref FrontendOrigin]
+        AllowHeaders: [authorization, content-type]
+        AllowMethods: [GET, POST, OPTIONS]
+        MaxAge: 600
+      Auth:
+        DefaultAuthorizer: CognitoJwtAuthorizer
+        Authorizers:
+          CognitoJwtAuthorizer:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              audience: [!Ref UserPoolClient]
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+
+  ApiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: app.handler
+      Environment:
+        Variables:
+          RECIPE_JOBS_QUEUE_URL: !Ref RecipeJobsQueue
+      Policies:
+        - DynamoDBCrudPolicy: {TableName: !Ref UsersTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref OrganizationsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref MembershipsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ListingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref ReservationsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AgentRunsTable}
+        - SQSSendMessagePolicy: {QueueName: !GetAtt RecipeJobsQueue.QueueName}
+        - S3CrudPolicy: {BucketName: !Ref MediaBucket}
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Ref OpenAISecret
+              - !Ref LangSmithSecret
+        - Statement:
+            Effect: Allow
+            Action: geo-places:Geocode
+            Resource: '*'
+      Events:
+        Health:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /health
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Listings:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /listings
+            Method: GET
+            Auth: {Authorizer: NONE}
+        Listing:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /listings/{listingId}
+            Method: GET
+            Auth: {Authorizer: NONE}
+        CreateListing:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /listings, Method: POST}
+        Reserve:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /reservations, Method: POST}
+        ReserveBundle:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /reservations/bulk, Method: POST}
+        MyReservations:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /me/reservations, Method: GET}
+        ListingReservations:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/listings/{listingId}/reservations', Method: GET}
+        CompleteReservation:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/reservations/{reservationId}/complete', Method: POST}
+        MyProfile:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /me, Method: GET}
+        BootstrapProfile:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /me/bootstrap, Method: POST}
+        Upload:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /uploads, Method: POST}
+        Extract:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /agent/extract, Method: POST}
+        Recipes:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /agent/recipes, Method: POST}
+        RecipeRuns:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: /agent/recipes, Method: GET}
+        RecipeRun:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/agent/recipes/{runId}', Method: GET}
+
+  RecipeWorkerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../backend/
+      Handler: recipe_worker.handler
+      Timeout: 180
+      Policies:
+        - DynamoDBReadPolicy: {TableName: !Ref ListingsTable}
+        - DynamoDBCrudPolicy: {TableName: !Ref AgentRunsTable}
+        - Statement:
+            Effect: Allow
+            Action: secretsmanager:GetSecretValue
+            Resource:
+              - !Ref OpenAISecret
+              - !Ref LangSmithSecret
+      Events:
+        RecipeJobs:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt RecipeJobsQueue.Arn
+            BatchSize: 1
+
+  RecipeJobsDeadLetterQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 1209600
+      SqsManagedSseEnabled: true
+
+  RecipeJobsQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      MessageRetentionPeriod: 86400
+      VisibilityTimeout: 1080
+      SqsManagedSseEnabled: true
+      RedrivePolicy:
+        deadLetterTargetArn: !GetAtt RecipeJobsDeadLetterQueue.Arn
+        maxReceiveCount: 2
+
+  UsersTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: userId, AttributeType: S}]
+      KeySchema: [{AttributeName: userId, KeyType: HASH}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  OrganizationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions: [{AttributeName: organizationId, AttributeType: S}]
+      KeySchema: [{AttributeName: organizationId, KeyType: HASH}]
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  MembershipsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: organizationId, AttributeType: S}
+        - {AttributeName: userId, AttributeType: S}
+      KeySchema:
+        - {AttributeName: organizationId, KeyType: HASH}
+        - {AttributeName: userId, KeyType: RANGE}
+      GlobalSecondaryIndexes:
+        - IndexName: UserIndex
+          KeySchema: [{AttributeName: userId, KeyType: HASH}]
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  ListingsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: listingId, AttributeType: S}
+        - {AttributeName: status, AttributeType: S}
+        - {AttributeName: pickupEnd, AttributeType: S}
+        - {AttributeName: organizationId, AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+      KeySchema: [{AttributeName: listingId, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: StatusPickupIndex
+          KeySchema:
+            - {AttributeName: status, KeyType: HASH}
+            - {AttributeName: pickupEnd, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: DonorCreatedIndex
+          KeySchema:
+            - {AttributeName: organizationId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  ReservationsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: reservationId, AttributeType: S}
+        - {AttributeName: listingId, AttributeType: S}
+        - {AttributeName: recipientUserId, AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+      KeySchema: [{AttributeName: reservationId, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: ListingIndex
+          KeySchema:
+            - {AttributeName: listingId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: RecipientIndex
+          KeySchema:
+            - {AttributeName: recipientUserId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  AgentRunsTable:
+    Type: AWS::DynamoDB::Table
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - {AttributeName: runId, AttributeType: S}
+        - {AttributeName: organizationId, AttributeType: S}
+        - {AttributeName: userRecipeId, AttributeType: S}
+        - {AttributeName: createdAt, AttributeType: S}
+      KeySchema: [{AttributeName: runId, KeyType: HASH}]
+      GlobalSecondaryIndexes:
+        - IndexName: OrgCreatedIndex
+          KeySchema:
+            - {AttributeName: organizationId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+        - IndexName: RecipeUserCreatedIndex
+          KeySchema:
+            - {AttributeName: userRecipeId, KeyType: HASH}
+            - {AttributeName: createdAt, KeyType: RANGE}
+          Projection: {ProjectionType: ALL}
+      TimeToLiveSpecification: {AttributeName: expiresAt, Enabled: true}
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
+
+  MediaBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins: [!Ref FrontendOrigin]
+            AllowedMethods: [PUT, GET]
+            AllowedHeaders: ['*']
+            MaxAge: 600
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteTemporaryAudio
+            Status: Enabled
+            Prefix: temporary-audio/
+            ExpirationInDays: 1
+
+  OpenAISecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub /second-serving/${Environment}/openai
+      Description: OpenAI API key; populate the apiKey field after deployment.
+      SecretString: '{"apiKey":"SET_IN_AWS_CONSOLE"}'
+
+  LangSmithSecret:
+    Type: AWS::SecretsManager::Secret
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      Name: !Sub /second-serving/${Environment}/langsmith
+      Description: LangSmith API key for agent tracing; populate the apiKey field after deployment.
+      SecretString: '{"apiKey":"SET_IN_AWS_CONSOLE"}'
+
+  AmplifyApp:
+    Type: AWS::Amplify::App
+    Properties:
+      Name: !Sub second-serving-${Environment}
+      Platform: WEB
+      BuildSpec: |
+        version: 1
+        frontend:
+          phases:
+            preBuild:
+              commands:
+                - npm ci
+            build:
+              commands:
+                - npm run build
+          artifacts:
+            baseDirectory: out
+            files:
+              - '**/*'
+          cache:
+            paths:
+              - node_modules/**/*
+      EnvironmentVariables:
+        - Name: NEXT_PUBLIC_AWS_REGION
+          Value: !Ref AWS::Region
+        - Name: NEXT_PUBLIC_COGNITO_USER_POOL_ID
+          Value: !Ref UserPool
+        - Name: NEXT_PUBLIC_COGNITO_CLIENT_ID
+          Value: !Ref UserPoolClient
+        - Name: NEXT_PUBLIC_API_URL
+          Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Environment}
+        - Name: NEXT_PUBLIC_SITE_URL
+          Value: !Ref SiteUrl
+
+  AmplifyBranch:
+    Type: AWS::Amplify::Branch
+    Properties:
+      AppId: !GetAtt AmplifyApp.AppId
+      BranchName: main
+      EnableAutoBuild: false
+      Stage: DEVELOPMENT
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${HttpApi}.execute-api.${AWS::Region}.${AWS::URLSuffix}/${Environment}
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  MediaBucketName:
+    Value: !Ref MediaBucket
+  OpenAISecretArn:
+    Value: !Ref OpenAISecret
+  LangSmithSecretArn:
+    Value: !Ref LangSmithSecret
+  AmplifyAppId:
+    Value: !GetAtt AmplifyApp.AppId
+  AmplifyDefaultDomain:
+    Value: !GetAtt AmplifyApp.DefaultDomain

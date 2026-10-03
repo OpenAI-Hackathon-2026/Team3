@@ -1,0 +1,11 @@
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "second-serving-dev"
+resolve_s3 = true
+s3_prefix = "second-serving-dev"
+region = "us-east-1"
+capabilities = "CAPABILITY_IAM"
+confirm_changeset = true
+fail_on_empty_changeset = false
+parameter_overrides = "Environment=dev OpenAIModel=gpt-5.5 FrontendOrigin=https://main.d3tdgkgyxb5md7.amplifyapp.com SiteUrl=https://main.d3tdgkgyxb5md7.amplifyapp.com"
